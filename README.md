@@ -2,7 +2,8 @@
 
 This project is working on Airbnb dataset, trying to figure out the relationship between the price of listings and other possibly related predictors such as the location of the listings, the review scores value of listings, host information and etc. 
 
-Report has not been formed yet so I added explanations of what I did below different headings. 
+'rmd.Rmd'file is the original code file. 
+Report has not been formed yet so I added explanations of what I did below different headings in 'rmd.Rmd'. 
 
 **My questions:**
 1. What kind of validation for models can I make? I just made residual plots, did ANOVA for models and compated the AIC value. 

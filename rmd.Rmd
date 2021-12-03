@@ -629,7 +629,7 @@ v_f <- spherical_variogram(v_fit$psill[1], v_fit$psill[2], v_fit$range[2])
 # 
 # # check variogram and covariance
 op <- par(mfrow = c(1, 2))
-h <- seq(0, 0.08, length = 100)
+h <- seq(0, 8, length = 100)
 plot(v$dist, v$gamma,  pch = 19, col = "gray",
      xlab = "distance", ylab = "semivariogram")
 lines(h, v_f(h))

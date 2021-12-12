@@ -1,0 +1,1417 @@
+---
+title: "MA678 midterm project"
+author: "Zike Tang"
+date: "2021/11/9"
+
+output:
+  pdf_document: default
+  
+header-includes:
+  - \usepackage{wrapfig}
+  
+---
+
+# Abstract
+
+```{r, include=FALSE}
+options(tinytex.verbose = TRUE)
+```
+
+\begin{wrapfigure}{R}{.35\textwidth}
+ \begin{center}
+    \includegraphics[width=.35\textwidth]{airbnb.png}       
+ \end{center}
+\end{wrapfigure}
+
+This project focuses on the listings information on Airbnb, trying to figure out the relationship between the price of listings and other information of hosts and listings. In order to get a understanding of the data sets, I tidied the data, drew various plots to describe it both numerically and graphically and made some conclusions on the distribution of review scores, types of listings on the Boston map and etc. As the the price of one listing is related to its nearby listings, I smoothed it on the spatial level With spatial kriging method to get a better continuity of listings price for further modeling. Multilevel models are created including predictors that have different trends among tracts and others related to the price of listings. Conclusion is that listings with licenses permission, owed by hosts with good services quality have higher price on average when being compared with different tracts in Boston.  
+
+
+# Introduction
+
+Airbnb is an American technological company that provides an online marketplace for lodging worldwide, mainly homestay for vacations rentals, and tourism activities. Listings price varies from listing to listing and it is one of the main factors that customers will consider when they decide whether or not to rent a house on Airbnb. Factors that may influence the price of listings involve both from the information of the listings such as the location, the room type and the furniture conditions, and the information about hosts from response efficiency to whether or not they are super-hosts and etc. This project aims to figure out how these factors interact with the listing price. 
+
+Plus, common descriptive statistic of price of listings does not incorporate its spatial characteristics. In this case, the price of listing of one tract partly influences the price of listing of tracts nearby. Smoothed listing price will be obtained using kriging which will be explained after.  
+
+When fitting the models, there are different trends for Boston tracts when considering the relationships between different predictors, which leads to the application of multilevel modeling. In this case, both the variances between different listings and different tracts are considered.  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(dplyr)
+library(readr)
+library(geojsonR)
+
+library(tidyr)
+library(magrittr)
+library(ggplot2)
+library(sf)
+library(tmap)
+library(viridis)
+library(plotly)
+library(arm)
+library(gridExtra)
+library(forcats)
+library(gstat) 
+library(sp)
+library(base)
+library(ggpubr)
+library(sentimentr)
+library(tm)
+library(tidytext)
+library(textdata)
+library(wordcloud)
+library(wordcloud2)
+library(webshot)
+library(reshape2)
+library(redres)
+library(tinytex)
+library(lattice)
+```
+
+
+# Method
+
+## EDA
+
+Two main data sets were used in this project: one contains the listings and hosts information and another involves the listing reviews information from the content of reviews and the date. Data is downloaded from [Airbnb website](http://insideairbnb.com/get-the-data.html) and it was compiled in October 2021. The the spatial information of Boston tracts of 2020 version is also used for presenting distribution on Boston maps. This is obtained from [boston government](https://data.boston.gov/dataset/census-2020-tracts). Table 1 clarifies the name and meanings of predictors that are included in the modeling and details are shown in the model part. Figure 1 shows the distribution of price of listings and its ranks for Boston neighborhoods. West end has the highest listings price on average and most other Boston neighborhoods has large range of listings price. Listings price get highest in the central downtown part where locate most luxury shops and have more people living.  
+
+| Predictors names          | Attribute | Explanation |
+| :--:                      | :-----    | :----- |
+| price                     | NUMBER    | The price of listings |
+| host_response_rate        | NUMBER    | Proportion of request hosts giving responses |
+| host_response_time        | FACTOR    | Time taken to give response to customers |
+| host_is_superhost         | FACTOR    | Whether host is given a superhost title |
+| room_type                 | FACTOR    | The types of listing |
+| license_ornot             | FACTOR    | Whether the listing have license permitted |
+| GEOID20                   | FACTOR    | Boston tracts |
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+# install.packages('R.utils')
+listings <- fread("data/listings.csv.gz")
+# listings %>% write_csv("data/listings.csv")
+listings <- as_tibble(listings)
+# dim(listings)
+# distinct(listings, host_response_time)
+# distinct(listings, property_type)
+# distinct(listings, room_type)
+# distinct(listings, bathrooms)
+
+
+# REVIEWS <- fread("reviews.csv.gz")
+re <- read_csv("data/reviews.csv.gz")# without strange strings
+other_language <- grep("re", iconv(re$comments, "latin1", "ASCII", sub="re"))
+# length(other_language)# 106278
+review <- re[other_language, ]
+
+
+neighbourhoods <- read.csv("data/neighbourhoods.csv")
+# View(neighbourhoods)
+
+# install.packages("geojsonR")
+# FROM_GeoJson("neighbourhoods.geojson")
+
+reviews <- read.csv("reviews.csv")
+# str(reviews)
+c_reviews <- reviews %>% count(listing_id)
+# max(c_reviews$n)
+
+# calendar <- fread("calendar.csv.gz")
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+listing <- listings %>% dplyr::select(id, host_id, 
+                               host_response_time,
+                               host_response_rate,
+                               host_is_superhost,
+                               # host_total_listings_count, 
+                               host_has_profile_pic, 
+                               host_identity_verified, 
+                               neighbourhood_cleansed, 
+                               room_type, 
+                               price, 
+                               number_of_reviews,
+                               review_scores_value, 
+                               license, 
+                               longitude, 
+                               latitude
+                               )
+
+
+listing <- as.data.frame(listing)
+# dim(listing) # 3123   15
+
+# summary(is.na(listing)) # 861 na values in 'review_scores_value'
+listing <- listing %>% filter(!is.na(review_scores_value))
+# dim(listing) # 2262   15
+
+# originally, the host_total_listings_count does not match the unique number of listings each host has
+# maybe the reason that some hosts have listings not in boston
+# create new host_total_listings_count
+listing$host_total_listings_count <- rep(NA, dim(listing)[1])
+for(i in 1:dim(listing)[1]){
+  listing$host_total_listings_count[i] <- sum(listing$host_id == listing$host_id[i])
+}
+
+# number of hosts
+length(unique(listing$host_id)) # 1183
+
+sum(listing$host_response_time == "N/A") # 682
+sum(listing$host_response_rate == "N/A") # 682
+
+# filter na value
+unique <- lapply(listing, unique)
+unique$host_response_time # N/A + 3
+unique$host_response_rate # N/A
+unique$host_is_superhost # t/f
+unique$host_has_profile_pic # t/f
+unique$host_identity_verified # t/f
+length(unique$neighbourhood_cleansed) # 25
+unique$room_type # 4
+# unique$license
+unique$host_total_listings_count
+
+listin <- listing %>% filter(host_response_time != "N/A" &  host_response_rate != "N/A" )
+# summary(is.na(listin))
+
+# crerate new variables
+listin$host_response_time <- factor(listin$host_response_time, 
+                                    levels = c("within an hour", 
+                                               "within a few hours",
+                                               "within a day", 
+                                               "a few days or more"
+                                               ))
+listin$host_is_superhost <- factor(listin$host_is_superhost, 
+                                   levels = c("f", "t"))
+listin$host_has_profile_pic <- factor(listin$host_has_profile_pic, 
+                                   levels = c("f", "t"))
+listin$host_identity_verified <- factor(listin$host_identity_verified, 
+                                   levels = c("f", "t"))
+listin$room_type <- factor(listin$room_type, 
+                                   levels = c("Entire home/apt", "Private room", "Hotel room",  "Shared room"))
+
+listin$license_ornot <- ifelse(listin$license == "", 0, 1)
+listin$license_ornot <- factor(listin$license_ornot)
+
+listin$host_response_rate <- as.numeric(gsub("[\\%, ]", "", listin$host_response_rate))
+listin$host_response_rate <- listin$host_response_rate/100
+
+listin$price <- as.numeric(gsub("\\$", "", listin$price))
+sum(is.na(listin$price))
+listin <- listin %>% filter(price != 0, !is.na(price))
+
+dim(listin)
+
+count_hid <- count(listin, host_id)
+
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+
+# distribuiton of host_total_listings_count
+ap1 <- ggplot(data = listing, aes(x = host_total_listings_count))+
+  geom_histogram(binwidth = 1)+
+  ggtitle("Number of listings by hosts")
+
+# mp_tracts <- listin[ ,list(mp=mean(price), by=neighbourhood_cleansed)]
+# ggplot(mp_tracts, aes(x = reorder(neighbourhood_cleansed, -mp), y = mp))+
+#   geom_point()+
+#   ylab("Listings price")+
+#   xlab("Boston tracts")+
+#   theme(axis.text.x = element_text(angle = 90, hjust=0.95,vjust=0.2))
+
+count <- count(listin, neighbourhood_cleansed)
+ap2 <- ggplot(count, aes(x = reorder(neighbourhood_cleansed, -n), y = n))+
+  geom_bar(stat = "identity")+
+  coord_flip()+
+  ylab("Number of listings")+
+  xlab("Boston neighborhoods")+
+  geom_text(aes(label = n), hjust=-0.5, position = "dodge")+
+  ggtitle("Number of listings by Boston neighborhoods")
+
+
+# draw the distribution of review scores of 20 hosts
+# set.seed(1)
+# oh_hid <- sample(unique(listin$host_id), 20, replace = FALSE)
+# oh_listin <- listin %>% filter(host_id %in% oh_hid)
+# ggplot(oh_listin)+
+#   geom_density(alpha = .3)+
+#   aes(x = review_scores_value, color = host_id)+
+#   facet_wrap(~ host_id)+
+#   theme(legend.position = "none")+
+#   geom_rug()+
+#   xlab("review values")+ 
+#   geom_vline(xintercept = mean(oh_listin$review_scores_value), color = "red", lty = 2)
+
+
+ap3 <- ggplot(listin)+
+  geom_density(alpha = .3)+
+  aes(x = review_scores_value, color = neighbourhood_cleansed)+
+  facet_wrap(~ neighbourhood_cleansed)+
+  theme(legend.position = "none")+
+  geom_rug()+
+  xlab("review values")+ 
+  geom_vline(xintercept = mean(listin$review_scores_value), color = "red", lty = 2)+
+  ggtitle("Review socres distribution by Boston neighborhoods")
+
+
+
+# bar plot: type of listings
+roomdf <- listin %>% group_by(neighbourhood_cleansed, room_type) %>% summarize(Freq = n())
+total_room <- listin %>% group_by(neighbourhood_cleansed) %>% summarize(sum = n())
+ratio_room <- merge(roomdf, total_room, by = "neighbourhood_cleansed")
+ratio_room <- ratio_room %>% mutate(ratio = Freq/sum)
+
+ap4 <- ggplot(ratio_room, aes(x = Freq, y = neighbourhood_cleansed, fill = room_type))+
+  geom_bar(position = position_dodge(preserve = 'single'), stat = "identity")+
+  xlab("Number of rooms")+ ylab("Area")+
+  scale_fill_discrete(name = "Room type")+
+  ggtitle("Types of room by Boston neighborhoods")+
+  theme(axis.text.x = element_text(angle = 45))
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+boston <- st_read("Boston_Neighborhoods/Boston_Neighborhoods.shp", quiet = TRUE)
+epsg_wgs84 <- 4326
+# boston %>% st_transform(epsg_wgs84)
+
+sf_listin <- listin %>% st_as_sf(coords = c("longitude", "latitude")) %>% st_set_crs(epsg_wgs84)
+print(sf_listin, n = 5)
+
+ggplot()+
+  geom_point(data = listin,
+             aes(longitude,
+                 latitude,
+                 color = price, size = .8), alpha = .3)+
+  theme(legend.position = "none")
+
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+nopooling_rs <- listin %>% 
+  group_by(neighbourhood_cleansed) %>% 
+  do(tidy(lm(review_scores_value ~ 1, .)))
+
+rs <- data.frame(Name = count$neighbourhood_cleansed, nopool_rs = nopooling_rs$estimate, stringsAsFactors = FALSE)
+
+np_rs <- left_join(boston, rs, by = "Name")
+
+plot_nopool_rs <- np_rs %>%
+  ggplot(aes(fill = nopool_rs, color = nopool_rs))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1, option = "A")+
+  scale_color_viridis(direction = -1, option = "A")+
+  labs(title = "Review scores", subtitle = "Nopooling by boston neighborhoods")
+plot_nopool_rs
+
+
+
+ggplot(listin, aes(x = fct_reorder(neighbourhood_cleansed, review_scores_value),
+                   y = review_scores_value,
+                   color = neighbourhood_cleansed))+
+  geom_boxplot()+
+  geom_jitter(color = "black", width = .2, size = .5, alpha = .5)+
+  coord_flip()+
+  theme(legend.position = "none")+
+  labs(y = "Review scores value", x = "Boston neighborhoods")+
+  scale_x_discrete(position = "top")+
+  ggtitle("Boxplot of review scores value")
+  
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+mp <- listin %>% group_by(neighbourhood_cleansed) %>%
+  summarise_at(vars(price), list(mean_p = mean)) %>%
+  mutate(log_p = log(mean_p))
+names(mp)[1] <- "Name"
+# 
+join_p <- boston %>% left_join(mp, by = "Name")
+# 
+# join_p %>% 
+#   ggplot(aes(fill = log_p, color = log_p))+
+#   geom_sf()+
+#   coord_sf(crs = 5070, datum = NA)+
+#   scale_color_viridis(direction = -1, option = "A")+
+#   scale_fill_viridis(direction = -1, option = "A")+
+#   labs(title = "Average price of listings by boston neighborhoods")
+# 
+# plot_nopool_p <- join_p %>%
+#   ggplot(aes(fill = log_p, color = log_p))+
+#   geom_sf()+
+#   coord_sf(crs = 5070, datum = NA)+
+#   scale_fill_viridis(direction = -1)+
+#   scale_color_viridis(direction = -1)+
+#   labs(title = "Average listing price", subtitle = "Nopooling by boston neighborhoods")
+
+
+
+nopooling_p <- listin %>% 
+  group_by(neighbourhood_cleansed) %>% 
+  do(tidy(lm(log(price) ~ 1, .)))
+
+p <- data.frame(Name = count$neighbourhood_cleansed, nopool_p = nopooling_p$estimate, stringsAsFactors = FALSE)
+
+np_p <- left_join(boston, p, by = "Name")
+
+plot_nopool_p <- np_p %>%
+  ggplot(aes(fill = nopool_p, color = nopool_p))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)+
+  labs(title = "Listings price", subtitle = "Boston neighborhoods")+ theme(legend.position="bottom")
+plot_nopool_p
+
+
+figure1_2 <- ggplot(listin, aes(x = fct_reorder(neighbourhood_cleansed, price), y = price, color = neighbourhood_cleansed))+
+  geom_boxplot()+
+  geom_jitter(color = "black", width = .2, size = .5, alpha = .5)+
+  coord_flip()+
+  theme(legend.position = "none")+
+  labs(y = "Listing price", x = NULL)+
+  ggtitle("Boxplot of listings price")
+
+# plot_1 <- smooth_p_t %>% 
+#   ggplot(aes(fill = log_p, color = log_p))+
+#   geom_sf()+
+#   coord_sf(crs = 5070, datum = NA)+
+#   scale_fill_viridis(direction = -1)+
+#   scale_color_viridis(direction = -1)+
+#   labs(title = "Listing price", subtitle = "logarithmic listings price in Boston tracts")
+
+# library(png)
+# comb2pngs <- function(imgs, bottom_text = NULL){
+#   img1 <-  grid::rasterGrob(as.raster(readPNG(imgs[1])),
+#                             interpolate = FALSE)
+#   img2 <-  grid::rasterGrob(as.raster(readPNG(imgs[2])),
+#                             interpolate = FALSE)
+#   grid.arrange(img1, img2, ncol = 2, bottom = bottom_text)
+# }
+# 
+# 
+# png("listing price_tracts.png", width = 6, height = 6, units = 'in', res = 300)
+# plot_1 # Make plot
+# dev.off()
+# 
+# plot_1 <- "listing price_tracts.png"
+# plot_2 <- "listing price_boxplot.png"
+# comb2pngs(c(plot_1, plot_2))
+
+
+
+```
+
+```{r fig.height=6, message=FALSE, warning=FALSE, include=FALSE}
+# shapefile
+mrv_listin <- sf_listin %>%
+ group_by(neighbourhood_cleansed) %>%
+ summarise_at(vars(review_scores_value), list(mean_rs = mean)) %>%
+ dplyr::select(neighbourhood_cleansed, mean_rs)
+names(mrv_listin)[1] <- "Name"
+
+# ggplot()+geom_sf(data = boston)+ geom_sf(data = mrv_listin, aes(color = Name))+
+#  theme(legend.position = "none")
+
+# tm_shape(sf_listin) +
+#  tm_bubbles(col = "room_type", palette = "YlOrBr", size = .2)+
+#  tm_legend(outside = TRUE)
+
+ap5 <- ggplot()+
+  geom_sf(data = boston)+ 
+  geom_sf(data = sf_listin, aes(color = review_scores_value), size = 2, alpha = .5)+
+  scale_color_viridis() +
+  guides(size=guide_legend(override.aes = list(color = viridis(1))))+
+  ggtitle("Distribution of review scores value")
+
+ap6 <- ggplot()+
+  geom_sf(data = boston)+ 
+  geom_sf(data = sf_listin, aes(color = room_type), size = 2, alpha = .5)+
+  ggtitle("Distribution of types of listings")
+
+ap7 <- ggplot()+
+  geom_sf(data = boston)+ 
+  geom_sf(data = sf_listin, 
+          aes(color = number_of_reviews, size = number_of_reviews), alpha = .5)+
+  scale_color_viridis(direction = -1) +
+  guides(size=guide_legend(override.aes = list(color = viridis(3))))+
+  ggtitle("Where do most reviews come from?", subtitle = "Distribution of number of reviews")
+  # theme(legend.position = "none")
+
+ap8 <- ggplot()+
+  geom_sf(data = boston)+ 
+  geom_sf(data = sf_listin, 
+          aes(color = host_total_listings_count, size = host_total_listings_count), alpha = .5)+
+  scale_color_viridis(direction = -1, option = "G")+
+  guides(size=guide_legend(override.aes = list(color = viridis(5))))+
+  ggtitle("Where do hosts own more listings", subtitle = "Distribution of host total listings")
+
+
+```
+
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.height=4, fig.width=10, fig.cap="Boxplot and map plot of listings price"}
+
+ggarrange(figure1_2, plot_nopool_p , ncol = 2, widths = c(5, 4), heights = 2, align = "h")
+
+```
+
+## Spatial kriging and variogram
+
+Kriging is a process of spatial interpolation given a set of observations while variogram describe of the spatial continuity of the data. Figure 2 shows the spatial relationship of listing price in logarithmic form under the spherical assumptions which is a method commonly being used in testing continuity for spatial data. When distance goes farther, the variogram becomes larger and levels out at a distance point called range. In this project, the listing prices of two nearby tracts are dependent and the prices of listing are nearly independent for those tracts far away from each other. Therefore, spatial distribution of listings does have an impact in further prediction and modeling. Figure 3 shows the comparison before and after kriging on map. The variances of listing price get smaller after kriging. 
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+spherical_variogram <- function (n, ps, r) function (h) {
+  h <- h / r
+  n + ps * ifelse(h < 1, 1.5 * h - .5 * h ^ 3, 1)
+}
+
+v <- variogram(log(price) ~ 1, sf_listin)
+v_fit <- fit.variogram(v, vgm("Sph"))
+v_f <- spherical_variogram(v_fit$psill[1], v_fit$psill[2], v_fit$range[2])
+# 
+# # check variogram and covariance
+op <- par(mfrow = c(1, 2))
+h <- seq(0, 8, length = 100)
+plot(v$dist, v$gamma,  pch = 19, col = "gray",
+     xlab = "distance", ylab = "semivariogram")
+lines(h, v_f(h))
+abline(v = v_fit$range[2], col = "gray")
+plot(h, sum(v_fit$psill) - v_f(h), type = "l",
+     xlab = "distance", ylab = "covariogram",
+     ylim = c(0, sum(v_fit$psill)))
+points(0, sum(v_fit$psill), pch = 19)
+abline(v = v_fit$range[2], col = "gray")
+par(op)
+
+chol_solve <- function (C, v) backsolve(C, backsolve(C, v, transpose = TRUE))
+
+kriging_smooth_spherical <- function (formula, data, ...) {
+  v <- variogram(formula, data)
+  v_fit <- fit.variogram(v, vgm("Sph", ...))
+  v_f <- spherical_variogram(v_fit$psill[1], v_fit$psill[2], v_fit$range[2])
+  Sigma <- v_f(as.matrix(dist(coordinates(data)))) # semivariogram
+  Sigma <- sum(v_fit$psill) - Sigma # prior variance
+  tau2 <- v_fit$psill[1] # residual variance
+  C <- chol(tau2 * diag(nrow(data)) + Sigma)
+  y <- model.frame(formula, data)[, 1] # response
+  x <- model.matrix(formula, data)
+  # generalized least squares:
+  beta <- coef(lm.fit(backsolve(C, x, transpose = TRUE),
+                      backsolve(C, y, transpose = TRUE))) # prior mean
+  Sigma_inv <- chol2inv(chol(Sigma))
+  C <- chol(Sigma_inv + diag(nrow(data)) / tau2)
+  # posterior mean (smoother):
+  mu <- drop(chol_solve(C, y / tau2 + Sigma_inv %*% x %*% beta))
+  list(smooth = mu, prior_mean = beta)
+}
+
+
+tract2<-st_centroid(join_p) #Center the polygon
+tract2 = na.omit(tract2)
+#tract2$a = exp(tract2$Asthma)
+tract2$a = tract2$log_p #The distribution is un-normal, so we use the log transformation here.
+breaks <- seq(4.4, 6, by = .1)
+tmap_arrange(
+  tm_shape(tract2) +
+  tm_bubbles(col = "log_p", palette = "-RdYlBu", size = .3, breaks = breaks))
+library(purrr)
+tract3 <- tract2 %>%
+    mutate(x = unlist(map(tract2$geometry,1)),
+           y = unlist(map(tract2$geometry,2)))
+# tract3
+tract4 <- tract3 %>% st_sf() %>% as_Spatial()
+
+
+ks <- kriging_smooth_spherical(log_p ~ 1, tract4)
+y <- tract4$a
+op <- par(mfrow = c(1, 2))
+plot(ks$smooth, y); abline(0, 1, col = "red")
+plot(ks$smooth, type = "l", ylab = "y")
+points(y, pch = 19, col = "gray")
+abline(h = ks$prior_mean)
+par(op)
+tract2$smooth <- ks$smooth
+
+tmap_mode("plot")
+tmap_arrange(
+  tm_shape(tract4) +
+    tm_bubbles(col = "log_p", palette = "-RdYlBu", size = .3, breaks = breaks))
+
+
+# smoothed map comparison
+smooth_p <- data.frame(Name = count$neighbourhood_cleansed, 
+                    log_p = tract2$a, 
+                    smooth = tract2$smooth, 
+                    stringsAsFactors = FALSE)
+
+smooth_p <- left_join(boston, smooth_p, by = "Name")
+
+plot_original <- 
+  smooth_p %>% 
+  ggplot(aes(fill = log_p, color = log_p))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)
+
+plot_smooth <- 
+  smooth_p %>% 
+  ggplot(aes(fill = smooth, color = smooth))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)
+
+ggarrange(plot_original, plot_smooth, common.legend = TRUE)
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+tracts <- st_read("data/Census2020_Tracts/Census2020_tracts.shp")
+
+ggplot()+
+  geom_sf(data = tracts)+ 
+  geom_sf(data = sf_listin, aes(color = review_scores_value), size = 1, alpha = .5)+
+  scale_color_viridis() +
+  guides(size=guide_legend(override.aes = list(color = viridis(1))))+
+  ggtitle("Distribution of review scores value")
+
+
+# coordinates(listin) <- ~longitude+ latitude
+
+
+# st_crs(sf_listin) <- st_crs(tracts)
+# st_join(tracts, sf_listin)
+
+library(tigris)
+# coord <- data.frame(lat = listin$latitude, long = listin$longitude)
+# coord$census_code <- apply(coord, 1, 
+#                                function(row) call_geolocator_latlon(row['lat'], row['long']))
+# coord$GEOID20 <- substr(coord$census_code, start = 1, stop = 11)
+# coord$id <- listin$id
+# coord$price <- listin$price
+# 
+# write.csv(coord, 'coord.csv')
+coord <- read.csv("data/coord.csv")
+with_code_df <- merge(listin, coord)
+
+with_code <- left_join(sf_listin, coord, by = "id")
+
+try <- with_code %>% 
+  group_by(GEOID20) %>% 
+  do(tidy(lm(review_scores_value ~ 1, .)))
+
+try3 <- coord %>% count(GEOID20)
+
+try1 <- data.frame(GEOID20 = try3$GEOID20, 
+                   nopool_rs = try$estimate, stringsAsFactors = FALSE)
+try1$GEOID20 <- as.character(try1$GEOID20)
+
+try2 <- left_join(tracts, try1, by = "GEOID20")
+
+try2 %>%
+  ggplot(aes(fill = nopool_rs, color = nopool_rs))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)+
+  labs(title = "Review scores", subtitle = "Nopooling by boston tracts")
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+spherical_variogram <- function (n, ps, r) function (h) {
+  h <- h / r
+  n + ps * ifelse(h < 1, 1.5 * h - .5 * h ^ 3, 1)
+}
+
+chol_solve <- function (C, v) backsolve(C, backsolve(C, v, transpose = TRUE))
+# 
+kriging_smooth_spherical <- function (formula, data, ...) {
+  v <- variogram(formula, data)
+  v_fit <- fit.variogram(v, vgm("Sph", ...))
+  v_f <- spherical_variogram(v_fit$psill[1], v_fit$psill[2], v_fit$range[2])
+  Sigma <- v_f(as.matrix(dist(coordinates(data)))) # semivariogram
+  Sigma <- sum(v_fit$psill) - Sigma # prior variance
+  tau2 <- v_fit$psill[1] # residual variance
+  C <- chol(tau2 * diag(nrow(data)) + Sigma)
+  y <- model.frame(formula, data)[, 1] # response
+  x <- model.matrix(formula, data)
+  # generalized least squares:
+  beta <- coef(lm.fit(backsolve(C, x, transpose = TRUE),
+                      backsolve(C, y, transpose = TRUE))) # prior mean
+  Sigma_inv <- chol2inv(chol(Sigma))
+  C <- chol(Sigma_inv + diag(nrow(data)) / tau2)
+  # posterior mean (smoother):
+  mu <- drop(chol_solve(C, y / tau2 + Sigma_inv %*% x %*% beta))
+  list(smooth = mu, prior_mean = beta)
+}
+
+v <- variogram(log(price.x) ~ 1, with_code)
+v_fit <- fit.variogram(v, vgm("Sph"))
+v_f <- spherical_variogram(v_fit$psill[1], v_fit$psill[2], v_fit$range[2])
+# 
+```
+
+```{r echo=FALSE, fig.cap="Variogram", fig.height=4, fig.width=8, message=FALSE, warning=FALSE}
+# # check variogram and covariance
+op <- par(mfrow = c(1, 2))
+h <- seq(0, 8, length = 100)
+plot(v$dist, v$gamma,  pch = 19, col = "gray",
+     xlab = "distance", ylab = "semivariogram")
+lines(h, v_f(h))
+abline(v = v_fit$range[2], col = "gray")
+plot(h, sum(v_fit$psill) - v_f(h), type = "l",
+     xlab = "distance", ylab = "covariogram",
+     ylim = c(0, sum(v_fit$psill)))
+points(0, sum(v_fit$psill), pch = 19)
+abline(v = v_fit$range[2], col = "gray")
+par(op)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+mean_p_tracts <- coord %>%
+ group_by(GEOID20) %>%
+ summarise_at(vars(price), list(mean_p = mean)) %>%
+ dplyr::select(GEOID20, mean_p)
+mean_p_tracts$GEOID20 <- as.character(mean_p_tracts$GEOID20)
+
+join_tracts <- left_join(tracts, mean_p_tracts, by = "GEOID20")
+
+tract_2<-st_centroid(join_tracts) #Center the polygon
+tract_2 = na.omit(tract_2)
+tract_2$a = log(tract_2$mean_p) #The distribution is un-normal, so we use the log transformation here.
+# breaks <- seq(4.4, 6, by = .1)
+tmap_arrange(
+  tm_shape(tract_2) +
+  tm_bubbles(col = "a", palette = "-RdYlBu", size = .3))
+library(purrr)
+tract_3 <- tract_2 %>%
+    mutate(x = unlist(map(tract_2$geometry,1)),
+           y = unlist(map(tract_2$geometry,2)))
+# tract_3
+tract_4 <- tract_3 %>% st_sf() %>% as_Spatial()
+
+
+k_s <- kriging_smooth_spherical(a ~ 1, tract_4)
+y <- tract_4$a
+op <- par(mfrow = c(1, 2))
+plot(k_s$smooth, y); abline(0, 1, col = "red")
+plot(k_s$smooth, type = "l", ylab = "y")
+points(y, pch = 19, col = "gray")
+abline(h = k_s$prior_mean)
+par(op)
+tract_2$smooth <- k_s$smooth
+
+tmap_mode("plot")
+tmap_arrange(
+  tm_shape(tract_4) +
+    tm_bubbles(col = "a", palette = "-RdYlBu", size = .3))
+
+
+# smoothed map comparison
+smooth_p_t <- data.frame(GEOID20 = tract_2$GEOID20, 
+                    log_p = tract_2$a, 
+                    smooth = tract_2$smooth, 
+                    stringsAsFactors = FALSE)
+
+smooth_p_t <- left_join(tracts, smooth_p_t, by = "GEOID20")
+
+plot_original_t <- 
+  smooth_p_t %>% 
+  ggplot(aes(fill = log_p, color = log_p))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)+
+  labs(title = "Listing price", subtitle = "Before kriging")
+
+plot_smooth_t <- 
+  smooth_p_t %>% 
+  ggplot(aes(fill = smooth, color = smooth))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)+
+  labs(title = "Listing price", subtitle = "After kriging")
+
+figure2 <- ggarrange(plot_original_t, plot_smooth_t, common.legend = TRUE, legend = "left")
+```
+
+```{r echo=FALSE, fig.cap="Kriging comparison", fig.height=4, fig.width=8}
+figure2
+```
+
+## Models Fitting
+
+At the beginning, two models are built: one only includes the various intercept for tracts and another includes all the related predictors, such as whether the hosts have profile picture on website, whether their identities are verified, the review scores of listings and the number of total listings owned by each host which is not listed in the above table. 
+
+They are excluded because they are not significant. The picture and identity of hosts might not influence customer's decision on renting house. We may consider that the listings with good comments have higher price. The difference of review scores is small among different tracts in this case, which means listings are nice in Boston overall. Moreover, Customers usually do not care about the number of listings owed by the hosts.  
+
+After drawing the relationships of other predictors among different tracts(shown in appendix), host response rate and response time are included to be analyzed their various slope effect. Intercepts among tracts are not considered because there is little difference after analysis. Room types, whether host is a superhost and whether the listing has license permitted are kept in simple form in the model. The listings price is taken the logarithmic form to better present the result. 
+
+Finally, the final model is defined as below:
+```
+lmer(log(price)~
+       room_type+
+       host_is_superhost+
+       license_ornot+
+       (host_response_rate + host_response_time -1| GEOID20)
+```
+
+# Result and assessment
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+
+# listin group by neighborhoods
+pooled <- lm(log(price) ~ 1, data = listin)
+display(pooled)
+
+# mrv
+unpooled <- lm(log(price) ~ factor(neighbourhood_cleansed) -1, data = listin)
+display(unpooled)
+coefplot(unpooled)
+
+
+partial <- lmer(log(price) ~ 1+ (1 | neighbourhood_cleansed), 
+                data = listin)
+display(partial)
+head(coef(partial)$neighbourhood_cleansed)
+head(ranef(partial)$neighbourhood_cleansed)
+
+
+# prediction for partial pooling
+p_pred <- predict(partial, 
+                  newdata = data.frame(neighbourhood_cleansed = mp$Name))
+length(p_pred) # 23
+
+
+tdp2 <- data.frame(Name = mp$Name, 
+                   pre_p = p_pred, 
+                   stringsAsFactors = FALSE)
+# head(tdp2)
+# dim(tdp2) # 23 2
+all_join <- left_join(join_p, tdp2, by = "Name")
+dim(all_join)
+
+
+# prediction for complete pooling
+cpred <- predict(pooled, newdata = data.frame(1))
+
+
+# unpooled map
+ggplot(data = all_join) + 
+  geom_sf(aes(fill =mean_p, color = mean_p)) + 
+  # scale_fill_gradient(limits = c(min,max), na.value = NA)+
+  ggtitle("no pooling")
+
+
+plot_partial <- 
+  all_join %>% 
+  ggplot(aes(fill = pre_p, color = pre_p))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)+
+  # scale_fill_gradientn(colors = viridis_pal()(9), limits=c(min, max), 
+                       # na.value = "grey50")+
+  labs(title = "Listing price", subtitle = "Partial pooling by boston neighborhoods")
+
+# grid.arrange(plot_nopool_p, plot_partial, ncol = 2)
+ggarrange(plot_nopool_p, plot_partial, common.legend = TRUE)
+
+
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# listin group by neighborhoods
+pooled <- lm(log(price) ~ 1, data = with_code_df)
+display(pooled)
+
+# mrv
+unpooled <- lm(log(price) ~ factor(GEOID20) -1, data = with_code_df)
+display(unpooled)
+coefplot(unpooled)
+
+
+partial <- lmer(log(price) ~ 1+ (1 | GEOID20), 
+                data = with_code_df)
+display(partial)
+head(coef(partial)$GEOID20)
+head(ranef(partial)$GEOID20)
+
+
+# prediction for partial pooling
+mp_t <- count(with_code_df, GEOID20)
+
+p_pred <- predict(partial, 
+                  newdata = data.frame(GEOID20 = mp_t$GEOID20))
+length(p_pred) # 23
+
+
+tdp2 <- data.frame(GEOID20 = as.character(mp_t$GEOID20), 
+                   pre_p = p_pred, 
+                   mean_p = mean_p_tracts$mean_p, 
+                   stringsAsFactors = FALSE)
+# head(tdp2)
+# dim(tdp2) # 23 2
+all_join <- left_join(tracts, tdp2, by = "GEOID20")
+dim(all_join)
+
+
+# prediction for complete pooling
+cpred <- predict(pooled, newdata = data.frame(1))
+
+
+# unpooled map
+# plot_nopool_t <- ggplot(data = all_join) + 
+#   geom_sf(aes(fill =mean_p, color = mean_p)) + 
+#   # scale_fill_gradient(limits = c(min,max), na.value = NA)+
+#   ggtitle("no pooling")
+nopooling_p_t <- with_code_df %>% 
+  group_by(GEOID20) %>% 
+  do(tidy(lm(log(price) ~ 1, .)))
+
+p_t <- data.frame(GEOID20 = as.character(mp_t$GEOID20), nopool_p = nopooling_p_t$estimate, stringsAsFactors = FALSE)
+
+np_p_t <- left_join(tracts, p_t, by = "GEOID20")
+
+plot_nopool_t <- np_p_t %>%
+  ggplot(aes(fill = nopool_p, color = nopool_p))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)+
+  labs(title = "Listings price", subtitle = "Nopooling by boston tracts")
+
+
+plot_partial_t <- 
+  all_join %>% 
+  ggplot(aes(fill = pre_p, color = pre_p))+
+  geom_sf()+
+  coord_sf(crs = 5070, datum = NA)+
+  scale_fill_viridis(direction = -1)+
+  scale_color_viridis(direction = -1)+
+  # scale_fill_gradientn(colors = viridis_pal()(9), limits=c(min, max), 
+                       # na.value = "grey50")+
+  labs(title = "Listing price", subtitle = "Partial pooling by boston tracts")
+
+ggarrange(plot_nopool_t, plot_partial_t, common.legend = TRUE, legend = "right")
+
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+# density of superhost&review score value
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+n = 2
+cols = gg_color_hue(n)
+
+# ggplot(listin)+
+#   geom_density(aes(x = review_scores_value, color = factor(host_is_superhost)))+
+#   xlab("Review scores value")+
+#   ggtitle("Density of review scores value")+
+#   annotate("text", x = 3.9, y = 1, label = "not super hosts",color=cols[1])+
+#   annotate("text", x = 4.3, y = 2.5, label = "super hosts",color=cols[2])+
+#   theme(legend.position = "none")
+
+
+partial_2 <- lmer(log(price) ~ 1+ 
+                    host_response_time+
+                    host_response_rate+
+                    (1 | host_is_superhost)+
+                    host_has_profile_pic+
+                    host_identity_verified+
+                    review_scores_value+
+                    room_type+
+                    host_total_listings_count+
+                    license_ornot+
+                    (1 | GEOID20), 
+                data = with_code_df)
+display(partial_2)
+head(coef(partial_2)$GEOID20)
+fixef(partial_2)
+head(ranef(partial_2)$GEOID20)
+
+# filter not significant predictors
+partial_3 <- lmer(log(price) ~ 
+                    # host_response_time+
+                    # host_response_rate+
+                    room_type+
+                    host_is_superhost+
+                    # host_total_listings_count+
+                    license_ornot+
+                    (host_response_rate+ host_response_time -1| GEOID20), 
+                data = with_code_df, REML = FALSE)
+anova(partial_3)
+coefs <- data.frame(coef(summary(partial_3)))
+coefs$df <- coef(summary(partial_3))[, 3]
+display(partial_3)
+summary(partial_3)
+# library(lmerTest)
+# anova(partial_3)
+# pvals.fnc(partial_3)
+head(coef(partial_3)$GEOID20)
+head(ranef(partial_3)$GEOID20)
+
+
+# install_github("jknowles/merTools")
+library(merTools) 
+randoms <- REsim(partial_3, n.sims = 2000)
+figure5 <- plotREsim(randoms)
+
+res_3 <- residuals(partial_3)
+res_3 <- as.data.frame(res_3)
+ggplot(res_3, aes(res_3))+  geom_histogram(fill = 'blue', alpha = 0.5)
+# plot(partial_3)
+
+
+# redyes redres
+# devtools::install_github("goodekat/redres")
+
+# all kinds of residual of model3
+rc_resids <- compute_redres(partial_3)
+pm_resids <- compute_redres(partial_3, type = "pearson_mar")
+sc_resids <- compute_redres(partial_3, type = "std_cond")
+
+r1 <- plot_redres(partial, type = "std_cond")+ylim(-3, 4.5)
+r2 <- plot_redres(partial_2, type = "std_cond")+ylim(-3, 4.5)
+r3 <- plot_redres(partial_3, type = "std_cond")+ylim(-3, 4.5)
+ggarrange(r1, r3, ncol = 2, nrow = 1)
+
+
+plot_resqq(partial)+ylim(-2, 2)+xlim(-2, 2)
+plot_resqq(partial_2)+ylim(-2, 2)+xlim(-2, 2)
+plot_resqq(partial_3)+ylim(-2, 2)+xlim(-2, 2)
+
+plot_ranef(partial_2)
+plot_ranef(partial_3)
+
+
+plot_redres(partial_3, type = "std_cond") +
+  geom_smooth(method = "loess") +
+  theme_classic() +
+  labs(title = "Residual Plot")
+  
+pr1 <- plot_redres(partial, type = "pearson_cond") +
+  geom_smooth(method = "loess") +
+  theme_classic() +
+  labs(title = "Residual Plot")
+
+pr2 <- plot_redres(partial_3, type = "pearson_cond") +
+  geom_smooth(method = "loess") +
+  theme_classic() +
+  labs(title = "Residual Plot")
+
+figure4 <- ggarrange(pr1, pr2, ncol = 2, nrow = 1)
+
+plot_redres(partial_3, type = "raw_mar") +
+  geom_smooth(method = "loess") +
+  theme_classic() +
+  labs(title = "Residual Plot")
+  
+
+
+# install.packages("report")
+# library(report)
+# report(partial_3)
+
+# install.packages("qualityTools")
+# library("qualityTools")
+# dotplot.ranef.mer(partial_3)
+
+require(lme4)                           
+require(lattice) 
+library(lme4)
+library(lattice)
+ggCaterpillar <- function(re, QQ=TRUE, likeDotplot=TRUE, reorder=TRUE) {
+  require(ggplot2)
+  f <- function(x) {
+    pv   <- attr(x, "postVar")
+    cols <- 1:(dim(pv)[1])
+    se   <- unlist(lapply(cols, function(i) sqrt(pv[i, i, ])))
+    if (reorder) {
+      ord  <- unlist(lapply(x, order)) + rep((0:(ncol(x) - 1)) * nrow(x), each=nrow(x))
+      pDf  <- data.frame(y=unlist(x)[ord],
+                         ci=1.96*se[ord],
+                         nQQ=rep(qnorm(ppoints(nrow(x))), ncol(x)),
+                         ID=factor(rep(rownames(x), ncol(x))[ord], levels=rownames(x)[ord]),
+                         ind=gl(ncol(x), nrow(x), labels=names(x)))
+    } else {
+      pDf  <- data.frame(y=unlist(x),
+                         ci=1.96*se,
+                         nQQ=rep(qnorm(ppoints(nrow(x))), ncol(x)),
+                         ID=factor(rep(rownames(x), ncol(x)), levels=rownames(x)),
+                         ind=gl(ncol(x), nrow(x), labels=names(x)))
+    }
+
+    if(QQ) {  ## normal QQ-plot
+      p <- ggplot(pDf, aes(nQQ, y))
+      p <- p + facet_wrap(~ ind, scales="free")
+      p <- p + xlab("Standard normal quantiles") + ylab("Random effect quantiles")
+    } else {  ## caterpillar dotplot
+      p <- ggplot(pDf, aes(ID, y)) + coord_flip()
+      if(likeDotplot) {  ## imitate dotplot() -> same scales for random effects
+        p <- p + facet_wrap(~ ind)
+      } else {           ## different scales for random effects
+        p <- p + facet_grid(ind ~ ., scales="free_y")
+      }
+      p <- p + xlab("Levels") + ylab("Random effects")
+    }
+
+    p <- p + theme(legend.position="none")
+    p <- p + geom_hline(yintercept=0)
+    p <- p + geom_errorbar(aes(ymin=y-ci, ymax=y+ci), width=0, colour="black")
+    p <- p + geom_point(size = 1, colour="lightcoral") 
+    return(p)
+  }
+
+  lapply(re, f)
+}
+ggCaterpillar(ranef(partial_3,condVar=TRUE), QQ=TRUE, likeDotplot=FALSE, reorder=FALSE)[["GEOID20"]]
+
+# qqnorm(residuals(partial))
+# qqnorm(residuals(partial_2))
+# qqnorm(residuals(partial_3))
+
+
+anova(partial, partial_3, test = "Chisq")
+
+# consider interaction
+# library(corrplot)
+# library(GGally)
+# cor.test(listin$number_of_reviews, listin$review_scores_value)
+# ggpairs(listin[, c("price", "review_scores_value")])
+
+# why choose multi-level model
+# try <- data.frame(his = as.numeric(listin$host_is_superhost),
+#                   p = listin$price, 
+#                   nc = factor(listin$neighbourhood_cleansed))
+# # count(try, nc)
+# 
+# ggplot(try, aes(x = his, y = log(p), color = nc))+
+#   geom_point()+
+#   stat_summary(fun = "mean", geom = "line", alpha = .3)+
+#   stat_summary(fun = "mean", geom = "line", lty = 2, aes(group = 1), color = "black")+
+#   theme(legend.position="none")+
+#   xlim("0", "1")
+
+# lis <- listings[, c("host_is_superhost", "neighbourhood_cleansed", "review_scores_value")]
+# lis <- lis %>% filter(review_scores_value!= "NA" & neighbourhood_cleansed == "Allston")
+# lis$host_is_superhost <- as.factor(lis$host_is_superhost)
+# plot(lis$host_is_superhost, lis$review_scores_value)
+
+
+# confint(partial_3)
+coef(partial_3)
+
+plot(partial_3, resid(., type = "pearson") ~ fitted(.),
+     abline = 0, pch = 20, cex = .8, id = 0.05,
+     xlab = "Ftted values", ylab = "Pearson Residuals")
+
+```
+
+The hotel room and the license are positive with listing price while the other predictors are negative with listing price. For the fixed coefficients, intercept, room types, especially the private and shared types, and whether the listing has a license are significant. Whether host is superhost is not that significant comparatively but still has relationship with the listing price. Results are shown in table 2. 
+
+| Predictors names          | Estimate  | Std. Error | t.value    | 
+| :--:                      | :-----    | :-----     | :-----     |
+| intercept                 | 4.90130   | 0.03431    | 143.324735 |      
+| room_type Private room    | -0.84347  | 0.02754    | -30.711543 |   
+| room_type Hotel room      | 0.19068   | 0.13268    | 1.441391   |
+| room_type Shared room     | -1.38750  | 0.32233    | -4.313799  |
+| host_is_superhost         | -0.08684  | 0.02672    | -3.260852  |
+| license_ornot1            | 0.46292   | 0.02976    | 15.583953  |
+
+Figure 4 shows the normal quantile for the random coefficients. Simulated Values that have a significant confidence interval which does not overlap zero are highlighted in black. Although the normal quantile for host response rate is not significant, the model still keeps the host response rate since it makes the whole model predict well. 
+
+```{r echo=FALSE, fig.cap="Normal quantile for the random coefficients", fig.height=5, fig.width=8, message=FALSE, warning=FALSE}
+figure5
+```
+
+# Discussion
+
+Compared to the price of the entire home or apartment rooms, the price of shared rooms are lower on average. Hotels have the highest price on overage and it makes sense because hotels are often rent for shorter periods compared to other types of rooms. Services such as morning call, breakfast and amusement park in the hotels which are not usually offered by other types of room also add value to the price. 
+
+Another interesting point is that if the host is a superhost, the price of listings is a little lower than those price of houses owed by normal hosts. I suppose that hosts get satisfied with the superhost identification, which might encourage hosts to provide discounts or better services for customers. It is not surprised that listings with license permitted have higher price on average. Listings with permissions will guarantee services and refunds, which increases the underlying operation costs. 
+
+There are four types of host response time in this case: within an hour, within a few hours, within a day and within a few days or more. When looking at the random effects, variance of long response is small comparatively, which means there are little differences of price change among tracts for those listings with hosts giving slow responses. This can be explained that for listings with hosts who do not give timely response, their price change behaves similarly and contact services of hosts do mainly influence their listings price. Therefore, it is suggested that hosts should pay more attention to give instant feedback for customers or they will lose them in a short period. 
+
+In conclusion, type of listings, hosts information and their services have relationship with the price of listings. Hosts are advised to improve their services quality to better serve the customers. 
+
+\newpage
+# Appendix
+
+## Additional plots
+
+- Most hosts have less than five listings. 
+
+```{r echo=FALSE, fig.height=4, fig.width=6, message=FALSE, warning=FALSE}
+ap1
+```
+
+- Dochester, Downtown and Roxbury rank first three of the number of listings. Dochester ranks first because it is a large area having the opportunity to cover more lisitngs. Downtown is the place where most people live in. 
+
+```{r echo=FALSE, fig.height=4, fig.width=10, message=FALSE, warning=FALSE}
+ap2
+```
+
+\newpage
+
+- Almost all the neighborhoods have their peak around and above the mean review scores value. 
+
+```{r echo=FALSE, fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+ap3
+```
+
+\newpage
+
+- Entire home or apartments and private rooms are the main types of room averall. 
+
+- Downtown has the most number of entire home or apartments and Dorchester has the most private rooms. 
+
+```{r echo=FALSE, fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+ap4
+```
+
+\newpage
+
+- Point map of various predictors
+
+```{r echo=FALSE, fig.height=8, fig.width=10, message=FALSE, warning=FALSE}
+ggarrange(ap5, ap6, ap7, ap8, nrow = 2, ncol = 2)
+```
+
+\newpage
+
+![Most positive words in reviews](po_cloud.png){width=250px}
+
+![Most negative words in reviews](ne_cloud.png){width=250px}
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+
+# word sentiment analysis
+re$comments <- removeNumbers(re$comments)
+tidy <- re %>% 
+  unnest_tokens(word, comments)
+
+tidy <- tidy %>% 
+  anti_join(stop_words) %>% 
+  dplyr::select(listing_id, word)
+
+# table of word count
+tidy %<>% 
+  filter(word != "br")
+
+tidy %>% 
+  count(word, sort = TRUE) %>% 
+  filter(n > 10000) %>% 
+  mutate(word = reorder(word, n)) %>% 
+  ggplot(aes(n, word))+
+  geom_col()+
+  labs(y = NULL)+
+  geom_text(aes(label = n), hjust=-0.5, position = "dodge")
+  
+
+get_sentiments("afinn")
+get_sentiments("bing")
+get_sentiments("nrc")
+
+id_nb <- listin %>% group_by(id, neighbourhood_cleansed) %>% dplyr::select(id, neighbourhood_cleansed)
+names(id_nb)[1] <- "listing_id"
+length(unique(tidy$listing_id)) # 2269
+
+tidy_nb <- merge(tidy, id_nb, by = "listing_id")
+dim(tidy_nb)
+
+bing_word_counts <- tidy_nb %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup()
+
+bing_word_counts %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 10) %>% 
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word, fill = sentiment)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = n), hjust=-0.5, position = "dodge")+
+  facet_wrap(~sentiment, scales = "free_y") +
+  labs(x = "Contribution to sentiment",
+       y = NULL)
+
+tidy_nb %>%
+  anti_join(stop_words) %>%
+  count(word) %>%
+  with(wordcloud(word, n, max.words = 100, colors=brewer.pal(8, "Dark2")))
+
+# positive and negative wordcloud
+po_word_counts <- bing_word_counts %>% filter(sentiment == "positive") %>% dplyr::select(word, n)
+ne_word_counts <- bing_word_counts %>% filter(sentiment == "negative") %>% dplyr::select(word, n)
+
+wordcloud2(po_word_counts, size=1.6, color='random-dark')
+po_cloud <- wordcloud2(po_word_counts, size = 1, minRotation = -0.52, maxRotation = -0.52, rotateRatio = 2)
+
+wordcloud2(ne_word_counts, size=1.6, color='random-dark')
+ne_cloud <- wordcloud2(ne_word_counts, size = 1, minRotation = -0.52, maxRotation = -0.52, rotateRatio = 2)
+
+# save image
+# webshot::install_phantomjs()
+# library("htmlwidgets")
+# saveWidget(ne_cloud,"ne_cloud.html",selfcontained = F)
+# webshot("ne_cloud.html", "ne_cloud.png", delay =5, vwidth = 650, vheight=650)
+
+tidy_nb %>%
+  inner_join(get_sentiments("bing")) %>%
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("gray20", "gray80"),
+                   max.words = 100)
+
+
+
+
+
+
+
+# sentence sentiment analysis
+
+review$raword <- removePunctuation(review$comments)
+review$raword <- paste(review$raword, ". ")
+
+# dat4$raword <- gsub('\\.', '', dat4$comments)
+# dat4$raword <- tolower(dat4$raword)
+# install.packages("splus2R")
+# library(splus2R)
+# lowerCase(REVIEWS$raword)
+
+# comments <- review$raword %>% 
+#   get_sentences() %>% 
+#    sentiment() %>% 
+#    mutate(polarity_level = ifelse(sentiment < 0, "Negative",
+#                                   ifelse(sentiment > 0,
+#                                          "Positive","Neutral")))
+
+# write.csv(comments, 'comments.csv')
+comments <- read.csv("data/comments.csv")
+
+comments %>% filter(polarity_level != "Neutral") %>% 
+  ggplot() + geom_histogram(aes(x = sentiment), binwidth = .1, bins = 30)
+
+# density plot
+comments %>% 
+  get_sentences() %>% 
+  sentiment_by(by = NULL) %>% #View()
+  ggplot() + geom_density(aes(ave_sentiment))
+
+```
+
+\newpage
+
+- Plots between predictors to see if there is a different pattern among different tracts
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+try <- data.frame(his = as.numeric(with_code_df$host_is_superhost),
+                  p = with_code_df$price, 
+                  nc = factor(with_code_df$GEOID20))
+# count(try, nc)
+
+his <- ggplot(try, aes(x = his, y = log(p), color = nc))+
+  geom_point()+
+  stat_summary(fun = "mean", geom = "line", alpha = .3)+
+  stat_summary(fun = "mean", geom = "line", lty = 2, aes(group = 1), color = "black")+
+  theme(legend.position="none")+
+  xlim("0", "1")+
+  labs(title = "Whether host is superhost vs listings price",x="Whether host is superhost",y="log(listings price)")
+
+
+# host_response_time
+try <- data.frame(hrt = with_code_df$host_response_time,
+                  p = with_code_df$price, 
+                  nc = factor(with_code_df$GEOID20))
+try$hrr <- ifelse(try$hrt == "within an hour", 0, 
+                  ifelse(try$hrt == "within a few hours", 1, 
+                         ifelse(try$hrt == "within a day", 2, 3)))
+
+hrt <- ggplot(data = try)+
+  aes(hrr,log(p))+
+  geom_point(alpha = 0.3,aes(color = nc))+
+  scale_fill_brewer(direction = -1)+
+  labs(title = "Host response time vs lisitngs price",x="Host response time",y="log(listings price)")+
+  geom_smooth(aes(color = nc),se=F,method = "lm", size = .1)+
+  theme(legend.position = "none")
+
+# host_response_rate
+try <- data.frame(hrr = with_code_df$host_response_rate,
+                  p = with_code_df$price, 
+                  nc = factor(with_code_df$GEOID20))
+
+
+hrr <- ggplot(data = try)+
+  aes(hrr,log(p))+
+  geom_point(alpha = 0.3,aes(color = nc))+
+  scale_fill_brewer(direction = -1)+
+  labs(title = "Host response rate vs listings price",x="Host response rate",y="log(listings price)")+
+  geom_smooth(aes(color = nc),se=F,method = "lm", size = .1)+
+  theme(legend.position = "none")
+
+# review_scores_value
+try <- data.frame(rsv = with_code_df$review_scores_value,
+                  p = with_code_df$price, 
+                  nc = factor(with_code_df$GEOID20))
+
+rsv <- ggplot(data = try)+
+  aes(rsv,log(p))+
+  geom_point(alpha = 0.3,aes(color = nc))+
+  scale_fill_brewer(direction = -1)+
+  labs(title = "Review scores vs listings price",x="Review scores value",y="log(listings price)")+
+  geom_smooth(aes(color = nc),se=F,method = "lm", size = .1)+
+  theme(legend.position = "none")
+
+
+# license_ornot
+try <- data.frame(lon = as.numeric(with_code_df$license_ornot),
+                  p = with_code_df$price, 
+                  nc = factor(with_code_df$GEOID20))
+
+lon <- ggplot(try, aes(x = lon, y = log(p), color = nc))+
+  geom_point()+
+  stat_summary(fun = "mean", geom = "line", alpha = .3)+
+  stat_summary(fun = "mean", geom = "line", lty = 2, aes(group = 1), color = "black")+
+  theme(legend.position="none")+
+  labs(title = "Whether hosts have license vs listings price",x="Whether hosts have license",y="log(listings price)")+
+  xlim("0", "1")
+
+his
+hrt
+hrr
+rsv
+lon
+```
+
+```{r echo=FALSE, fig.cap="", fig.height=8, fig.width=10, message=FALSE, warning=FALSE}
+ggarrange(his, hrt, hrr, rsv, lon, nrow = 3, ncol = 2)
+```
+
+## Citation
+
+- Mapping: https://map-rfun.library.duke.edu/032_thematic_mapping_geom_sf.html
+- Text mining: https://www.tidytextmining.com/
